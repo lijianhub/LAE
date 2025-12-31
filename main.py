@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
+import wandb
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -269,9 +271,30 @@ class MyModule(Module):
     def configure_optimizer(self, *_):
         return super().configure_optimizer(self.model.head, self.pets)
 
-
 if __name__ == "__main__":
+    # 生成带时间的实验名称（便于区分）
+    now_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # 初始化实验
+    run = wandb.init(
+        project="LAE",  # 项目名称（必填，同一账号下唯一，用于归类实验）
+        name=f"version3-{now_time}",  # 实验名称（可选，默认随机生成，建议自定义）
+        config={  # 超参数/实验配置（必填，会自动记录到云端，支持后续对比）
+            "lr": 0.0028125,
+            "batch_size": 24,
+            "num_workers": 4,
+            "epochs": 3,
+            "dataset": "cifar100",
+            "backbone": "ViT-B_16"
+        },
+        tags=["baseline", "cifar100", "image-classification"],  # 标签（可选，用于筛选实验）
+        notes="ViT-B_16 cifar100 baseline",  # 实验说明（可选）
+        mode="online"  # 运行模式（online=实时同步，offline=本地存储，dryrun=调试不记录）
+    )
+
     kwargs = dict(
         datamodule_cls=MyDataModule, module_cls=MyModule, config_cls=MyConf
     )
     App(**kwargs).run()
+
+    wandb.finish()

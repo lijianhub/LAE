@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import gc
+import wandb
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Tuple, Union
@@ -190,7 +191,7 @@ class Module(ModuleABC):
                     loss_dict["grad_norm"] = nn.utils.clip_grad_norm_(*args)
                 if self.cfg.clip_grad_value > 0:
                     args = (self.parameters(), self.cfg.clip_grad_value)
-                    nn.utils.clip_grad_value_(params, *args)
+                    nn.utils.clip_grad_value_(self.parameters(), *args)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
@@ -256,7 +257,7 @@ class Module(ModuleABC):
         n_tasks = self.current_task + 1
         render = lambda ms: ", ".join([f"{m.compute() * 100:.2f}" for m in ms])
         logging.info(
-            "==> Evaluation result %d"
+            "==> Evaluation results %d"
             "\n\tAcc: %.2f"
             "\n\tGlobal Per Task Accs: %s"
             "\n\tGlobal Task Accs Avg: %.2f"
@@ -267,6 +268,22 @@ class Module(ModuleABC):
             sum([acc.compute() * 100 for acc in self.val_task_accs]) / n_tasks,
             render(self.val_task_local_accs),
         )
+
+        val_acc_pct = self.val_acc.compute().cpu().item() * 100
+        task_accs_pct = [acc.compute().cpu().item() * 100 for acc in self.val_task_accs]
+        global_task_acc_avg = sum(task_accs_pct) / n_tasks
+
+        val_acc_pct_rounded = round(val_acc_pct, 2)
+        global_task_acc_avg_rounded = round(global_task_acc_avg, 2)
+
+        wandb.log({
+            "Evaluation/taskId": self.current_task,
+            "Evaluation/Epoch": self.current_epoch,
+            "Evaluation/Accuracy(%)": val_acc_pct_rounded,  # 已格式化的数值
+            "Evaluation/GlobalPerTaskAccs": render(self.val_task_accs),
+            "Evaluation/GlobalTaskAccsAvg(%)": global_task_acc_avg_rounded,  # 已格式化的数值
+            "Evaluation/LocalPerTaskAccs": render(self.val_task_local_accs)
+        })
 
     def configure_optimizer(
         self, *modules: List[nn.Module]

@@ -1,3 +1,13 @@
+## Others
+
+```bash
+conda activate py310
+python main.py --config=vit_lora.yaml
+pip install wandb
+ wandb sync --sync-all
+```
+
+
 # <div align="center"><b> A Unified Continual Learning Framework with General <br /> Parameter-Efficient Tuning </b></div>
 
 <div align="center">
