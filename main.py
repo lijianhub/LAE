@@ -277,13 +277,13 @@ if __name__ == "__main__":
 
     # 初始化实验
     run = wandb.init(
-        project="LAE",  # 项目名称（必填，同一账号下唯一，用于归类实验）
-        name=f"version3-{now_time}",  # 实验名称（可选，默认随机生成，建议自定义）
-        config={  # 超参数/实验配置（必填，会自动记录到云端，支持后续对比）
+        project="LAE",
+        name=f"version0-20260103-256-5-cifar100",
+        config={
             "lr": 0.0028125,
-            "batch_size": 24,
-            "num_workers": 4,
-            "epochs": 3,
+            "batch_size": 256,
+            "num_workers": 8,
+            "epochs": 5,
             "dataset": "cifar100",
             "backbone": "ViT-B_16"
         },

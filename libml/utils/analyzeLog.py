@@ -12,21 +12,21 @@ def extract_single_task_data(log_file_path: str) -> Optional[Dict[str, List[Dict
         with open(log_file_path, 'r', encoding='utf-8') as f:
             log_content = f.read()
     except FileNotFoundError:
-        print(f"❌ Error: Log file not found at '{log_file_path}'")
+        print(f"Error: Log file not found at '{log_file_path}'")
         return None
     except PermissionError:
-        print(f"❌ Error: No permission to read log file at '{log_file_path}'")
+        print(f"Error: No permission to read log file at '{log_file_path}'")
         return None
 
-    eval_pattern = r'==> Evaluation result (\d+)\s+' \
+    eval_pattern = r'==> Evaluation results (\d+)\s+' \
                    r'Acc: (\d+\.\d+)\s+' \
-                   r'Global Per Task Accs: ([\d+\.\d+, ]+)\s+' \
+                   r'Global Per Task Accs: ([\d\.]+(?:, [\d\.]+)*)\s+' \
                    r'Global Task Accs Avg: (\d+\.\d+)\s+' \
-                   r'Local Per Task Accs: ([\d+\.\d+, ]+)'
+                   r'Local Per Task Accs: ([\d\.]+(?:, [\d\.]+)*)'
 
     eval_matches = re.findall(eval_pattern, log_content, re.DOTALL)
     if not eval_matches:
-        print("❌ No evaluation results found in the log file")
+        print("No evaluation results found in the log file")
         return None
 
     task_data = {}
@@ -45,7 +45,7 @@ def extract_single_task_data(log_file_path: str) -> Optional[Dict[str, List[Dict
         num_tasks = len(global_per_task_accs)
         if len(local_per_task_accs) != num_tasks:
             print(
-                f"⚠️ Mismatched task counts in Evaluation {eval_id} (Global: {num_tasks}, Local: {len(local_per_task_accs)})")
+                f"Mismatched task counts in Evaluation {eval_id} (Global: {num_tasks}, Local: {len(local_per_task_accs)})")
             continue
 
         if task_id is None:
@@ -74,7 +74,7 @@ def save_task_data_to_csv(task_data: Dict[str, List[Dict]], csv_file_path: str):
         flattened_data.extend(results)
 
     if not flattened_data:
-        print("❌ No data to save")
+        print("Error: No data to save")
         return
 
     # Create parent directory if it doesn't exist
@@ -82,9 +82,9 @@ def save_task_data_to_csv(task_data: Dict[str, List[Dict]], csv_file_path: str):
     if csv_dir and not os.path.exists(csv_dir):
         try:
             os.makedirs(csv_dir, exist_ok=True)  # exist_ok=True avoids error if dir exists
-            print(f"✅ Created parent directory: '{csv_dir}'")
+            print(f"Created parent directory: '{csv_dir}'")
         except PermissionError:
-            print(f"❌ Error: No permission to create directory '{csv_dir}'")
+            print(f"Error: No permission to create directory '{csv_dir}'")
             return
 
     # Save CSV
@@ -94,11 +94,11 @@ def save_task_data_to_csv(task_data: Dict[str, List[Dict]], csv_file_path: str):
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             writer.writerows(flattened_data)
-        print(f"✅ CSV saved successfully to: '{csv_file_path}'")
+        print(f"CSV saved successfully to: '{csv_file_path}'")
     except PermissionError:
-        print(f"❌ Error: No permission to write CSV file at '{csv_file_path}'")
+        print(f"Error: No permission to write CSV file at '{csv_file_path}'")
     except Exception as e:
-        print(f"❌ Failed to save CSV: {str(e)}")
+        print(f"Failed to save CSV: {str(e)}")
 
 
 def print_single_task_summary(task_data: Dict[str, List[Dict]]):
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     # Replace with YOUR ACTUAL absolute paths (find via: right-click file → "Copy Path" → paste here)
     # Example Windows absolute path format: "C:/Users/40518/code/LAE/logs/cifar100/version_3/task_9/log.lj.40518.log.INFO.20251231-164719.28296"
     # Example Linux/macOS absolute path format: "/home/40518/code/LAE/logs/cifar100/version_3/task_9/log.lj.40518.log.INFO.20251231-164719.28296"
-    LOG_FILE_PATH = "C:/Users/40518/code/LAE/logs/cifar100/version_3/task_9/log.lj.40518.log.INFO.20251231-164719.28296"  # UPDATE THIS
+    LOG_FILE_PATH = "C:/Users/40518/code/LAE/logs/cifar100/version_0/task_9/log.lj.40518.log.INFO.20260104-013633.13756"  # UPDATE THIS
     CSV_SAVE_PATH = "C:/Users/40518/code/LAE/results/task9.csv"  # UPDATE THIS
 
     # --------------------------
@@ -137,22 +137,22 @@ if __name__ == "__main__":
     # --------------------------
     print(f"🔍 Checking log file path: '{LOG_FILE_PATH}'")
     if not os.path.exists(LOG_FILE_PATH):
-        print(f"❌ Fatal Error: Log file does not exist. Please check the path.")
-        print(f"💡 Tip: Use absolute path (right-click log file → 'Copy Path' → paste into LOG_FILE_PATH)")
+        print(f"Fatal Error: Log file does not exist. Please check the path.")
+        print(f"Tip: Use absolute path (right-click log file → 'Copy Path' → paste into LOG_FILE_PATH)")
         exit(1)  # Exit if log file is missing (critical error)
     if not os.path.isfile(LOG_FILE_PATH):
-        print(f"❌ Fatal Error: '{LOG_FILE_PATH}' is not a file (it's a directory). Check the path.")
+        print(f"Fatal Error: '{LOG_FILE_PATH}' is not a file (it's a directory). Check the path.")
         exit(1)
 
     # --------------------------
     # Extract and Save Data
     # --------------------------
-    print("📥 Extracting data from single-task log file...")
+    print("Extracting data from single-task log file...")
     single_task_data = extract_single_task_data(LOG_FILE_PATH)
 
     if single_task_data:
         print_single_task_summary(single_task_data)
-        print(f"\n💾 Saving data to CSV: '{CSV_SAVE_PATH}'")
+        print(f"\nSaving data to CSV: '{CSV_SAVE_PATH}'")
         save_task_data_to_csv(single_task_data, CSV_SAVE_PATH)
     else:
-        print("❌ Data extraction failed (see errors above for details)")
+        print("Data extraction failed (see errors above for details)")
