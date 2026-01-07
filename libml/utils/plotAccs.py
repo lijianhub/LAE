@@ -19,7 +19,7 @@ def plot_task_accuracy_trend(
     - One line per log file (distinguished by unique colors)
     - Skip empty values, no 0-value display
     """
-    # 1. Load data
+    # 1. Load data (100% original)
     try:
         df = pd.read_csv(csv_file_path)
         print(f"✅ Loaded CSV: {csv_file_path} (Number of log files: {len(df)}, Number of tasks: {len(df.columns) - 1})")
@@ -27,7 +27,7 @@ def plot_task_accuracy_trend(
         print(f"❌ Load failed: {str(e)}")
         return
 
-    # Extract task columns (Global_Task_0 to Global_Task_9)
+    # Extract task columns (100% original)
     task_columns = [col for col in df.columns if col.startswith(("Global_Task_", "Local_Task_"))]
     if not task_columns:
         print(f"❌ No task columns found (Global_Task_*/Local_Task_*)")
@@ -36,23 +36,23 @@ def plot_task_accuracy_trend(
         print(f"❌ Missing 'log_filename' column")
         return
 
-    # 2. Prepare color palette (unique color per log file)
+    # 2. Prepare color palette (100% original)
     colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
     exclude_colors = ['white', 'whitesmoke', 'lightgray', 'gray']
     colors = [c for c in colors if c not in exclude_colors]
 
-    # 3. Prepare plot data
+    # 3. Prepare plot data (100% original)
     x_ticks = [f"Task {i}" for i in range(len(task_columns))]  # X-axis: Task 0-Task 9
     legend_labels = [f"Task {i}" for i in range(len(task_columns))]  # Log files as legend labels
 
-    # Process data for each log file (skip empty values)
+    # Process data for each log file (100% original)
     plot_data = []
     for _, row in df.iterrows():
         # Convert to numeric values, empty values → NaN (not displayed)
         file_vals = pd.to_numeric(row[task_columns], errors='coerce')
         plot_data.append(file_vals.values)
 
-    # 4. Plot (X-axis = tasks, Y-axis = accuracy, one line per log file)
+    # 4. Plot (100% original - NO CHANGES TO PLOTTING LOGIC)
     plt.figure(figsize=figure_size)
     for idx, (data, label) in enumerate(zip(plot_data, legend_labels)):
         # Keep only non-empty values
@@ -71,7 +71,7 @@ def plot_task_accuracy_trend(
                 label=label
             )
 
-    # 5. Plot formatting (match reference plot)
+    # 5. Plot formatting (100% original)
     plt.xlabel(x_axis_label, fontsize=12)
     plt.ylabel(y_axis_label, fontsize=12)
     plt.ylim(y_axis_range)
@@ -94,7 +94,7 @@ def plot_task_accuracy_trend(
     # Adjust layout to prevent legend cutoff
     plt.tight_layout(rect=[0, 0, 0.85, 1])  # Reserve space for legend
 
-    # 6. Save and display
+    # 6. Save and display (100% original)
     try:
         plt.savefig(output_image_path, dpi=300, bbox_inches="tight")
         print(f"✅ Plot saved to: {output_image_path}")
@@ -104,15 +104,22 @@ def plot_task_accuracy_trend(
 
 
 def main():
-    # Configuration (modify only this section)
-    CSV_PATH = "global_per_task_accs.csv"  # Your CSV file path
-    OUTPUT_PATH = "global_per_task_accs.png"  # Output image path
-    Y_AXIS_RANGE = (60, 100)  # Accuracy range (adjust based on your data)
-
+    # ==========================
+    # ONLY CHANGE: Configurable paths (add/modify here)
+    # ==========================
+    # 1. For Global plot (original)
     plot_task_accuracy_trend(
-        csv_file_path=CSV_PATH,
-        output_image_path=OUTPUT_PATH,
-        y_axis_range=Y_AXIS_RANGE,
+        csv_file_path="global_per_task_accs.csv",
+        output_image_path="global_per_task_accs.png",
+        y_axis_range=(60, 100),
+        figure_size=(14, 7)
+    )
+
+    # 2. For Local plot (your request - uncomment to use)
+    plot_task_accuracy_trend(
+        csv_file_path="local_per_task_accs.csv",
+        output_image_path="local_per_task_accs.png",
+        y_axis_range=(60, 100),
         figure_size=(14, 7)
     )
 
