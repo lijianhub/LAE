@@ -19,6 +19,7 @@ from libml.model.pet import Adapter, Conv2dAdapter, KVLoRA, Prefix
 from libml.model.utils import freeze, unfreeze
 from libml.model.backbone.swin import SwinTransformer
 from libml.model.backbone.convnext import ConvNeXt
+from ood.GeneralizedOODFactory import GeneralizedOODFactory
 
 
 @dataclass
@@ -52,8 +53,19 @@ class MyModule(Module):
     train_acc: Accuracy
     loss_fn: nn.Module
 
+    def __init__(self, cfg: ModuleConf):
+        super().__init__(cfg)
+        self.ood_factory = None
+
     def setup_model(self):
         super().setup_model()
+
+        # Instantiate the Factory
+        self.ood_factory = GeneralizedOODFactory(
+            tau=0.04,
+            lambda_oe=0.5,
+            gradnorm_gamma=0.01
+        ).to(self.device)
 
         if getattr(self, "pets_emas", None) is None:
             freeze(self.model.backbone)
@@ -214,7 +226,7 @@ class MyModule(Module):
             else:
                 ema.update(self.pets_emas[idx - 1])
 
-    def eval_epoch(self, loader):
+    def eval_epoch_old(self, loader):
         task_ranges = []
         n_tasks = self.current_task + 1
         for t in range(n_tasks):
@@ -253,6 +265,256 @@ class MyModule(Module):
             gts.append(target)
         return pred_on, pred_off, pred_ens, gts
 
+    def _backbone_logits_and_features(self, x):
+        bb = self.model.backbone
+        if hasattr(bb, "forward_features"):
+            feats = bb.forward_features(x)
+        elif hasattr(bb, "get_intermediate_layers"):
+            tmp = bb.get_intermediate_layers(x, n=1)[-1]
+            feats = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
+        else:
+            raise RuntimeError("Backbone does not expose a features method.")
+        logits = self.model.head(feats)
+        return logits, feats
+
+    def eval_epoch_v1(self, loader):
+        task_ranges = []
+        n_tasks = self.current_task + 1
+        for t in range(n_tasks):
+            s = task_ranges[-1][-1] + 1 if task_ranges else 0
+            e = s + self.datamodule.num_classes_of(t)
+            task_ranges.append(list(range(s, e)))
+
+        pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        for _, batch in enumerate(loader):
+            input, target = batch[:2]
+
+            # 1. Forward Online (Learning Module)
+            # We need both logits and features for GradNorm
+            self.attach_pets(self.pets)
+            logits_on, features = self._backbone_logits_and_features(input)
+            logits_on = self.model.head(logits_on)
+            pred_on.append(logits_on.argmax(dim=1))
+
+            # 2. Forward Offline (Accumulation Module)
+            # We assume the first EMA in pets_emas is the primary stable expert
+            if len(self.pets_emas) > 0:
+                self.attach_pets(self.pets_emas[0].module)
+                logits_off = self.model(input)
+                pred_off.append(logits_off.argmax(dim=1))
+
+                # 3. Decision via GradNorm Factory (Ensemble Module)
+                # Uses 3.1.3 logic to calculate weight 'w' and combine experts
+                output = self.ood_factory.compute_ensemble(
+                    logits_on,
+                    features,
+                    logits_off,
+                    self.model.head[-1]  # Pass the current task head
+                )
+            else:
+                # Case for Task 0 (No EMAs yet)
+                output = logits_on.softmax(dim=1)
+                pred_off.append(logits_on.argmax(dim=1))
+
+            # Reset PETs to Online for safe state management
+            self.attach_pets(self.pets)
+
+            # 4. Standard Metrics and Bookkeeping
+            self.val_acc.update(output, target)
+            for t in batch[2].long().unique().tolist():
+                sel = batch[2] == t
+                self.val_task_accs[t].update(output[sel], target[sel])
+
+                t_range = task_ranges[t]
+                output_local = output[sel][:, t_range]
+                target_local = target[sel] - t_range[0]
+                self.val_task_local_accs[t].update(output_local, target_local)
+
+            pred_ens.append(output.argmax(dim=1))
+            gts.append(target)
+
+        return pred_on, pred_off, pred_ens, gts
+
+    # Define a head function for the "current task"
+    def head_fn(self, feats):
+        # Most Dynamic*Head modules will route to the corresponding head
+        # based on self.current_task. If its forward() requires a task_id,
+        # we pass it in.
+        try:
+            return self.model.head(feats, task_id=self.current_task)
+        except TypeError:
+            # If it doesn't require task_id, just forward normally
+            return self.model.head(feats)
+
+    def eval_epoch_v2(self, loader):
+        task_ranges = []
+        n_tasks = self.current_task + 1
+        for t in range(n_tasks):
+            s = task_ranges[-1][-1] + 1 if task_ranges else 0
+            e = s + self.datamodule.num_classes_of(t)
+            task_ranges.append(list(range(s, e)))
+
+        pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        for _, batch in enumerate(loader):
+            input, target = batch[:2]
+
+            # 1. Forward Online (Learning Module)
+            self.attach_pets(self.pets)
+
+            bb = self.model.backbone
+            if hasattr(bb, "forward_features"):
+                features = bb.forward_features(input)
+            elif hasattr(bb, "get_intermediate_layers"):
+                tmp = bb.get_intermediate_layers(input, n=1)[-1]
+                features = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
+            else:
+                raise RuntimeError("Backbone must expose forward_features or get_intermediate_layers.")
+
+            logits_on = self.model.head(features)
+            pred_on.append(logits_on.argmax(dim=1))
+
+            # 2. Forward Offline (Accumulation Module)
+            if len(self.pets_emas) > 0:
+                self.attach_pets(self.pets_emas[0].module)
+                logits_off = self.model(input)
+                pred_off.append(logits_off.argmax(dim=1))
+
+                # 3. Ensemble via OOD Factory
+                output = self.ood_factory.compute_ensemble(
+                    logits_on,
+                    features,
+                    logits_off,
+                    self.head_fn
+                )
+            else:
+                # Task 0（no EMA）
+                #Need softmax
+                output = logits_on.softmax(dim=1)
+                pred_off.append(logits_on.argmax(dim=1))
+
+            # Reset PETs
+            self.attach_pets(self.pets)
+
+            # 4. Metrics
+            self.val_acc.update(output, target)
+            for t in batch[2].long().unique().tolist():
+                sel = batch[2] == t
+                self.val_task_accs[t].update(output[sel], target[sel])
+
+                t_range = task_ranges[t]
+                output_local = output[sel][:, t_range]
+                target_local = target[sel] - t_range[0]
+                self.val_task_local_accs[t].update(output_local, target_local)
+
+            pred_ens.append(output.argmax(dim=1))
+            gts.append(target)
+
+        return pred_on, pred_off, pred_ens, gts
+
+    def _encode_for_head(self, x):
+        """
+        Returns the vector features (B, D) fed into DynamicSimpleHead.classify(...).
+        Automatically handles 4D CNN backbone features or token/CLS features from ViT.
+        """
+        bb = self.model.backbone
+        # Extract “backbone features”
+        if hasattr(bb, "forward_features"):
+            feats = bb.forward_features(x)
+        elif hasattr(bb, "get_intermediate_layers"):
+            tmp = bb.get_intermediate_layers(x, n=1)[-1]
+            feats = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
+        else:
+            raise RuntimeError("Backbone must expose forward_features or get_intermediate_layers.")
+
+        # Normalize everything into (B, D) vector features for the head's neck
+        if isinstance(feats, dict):
+            # Some timm ViTs return a dict; prioritize 'pooled' or 'x'
+            feats = feats.get("pooled", feats.get("x", None))
+            if feats is None:
+                raise RuntimeError("Unsupported features dict structure from backbone.")
+
+        if feats.ndim == 3:
+            # (B, N, D) token sequence -> take CLS token
+            feats = feats[:, 0]  # (B, D)
+            x_vec = self.model.head.neck(feats)  # pass through neck
+            return x_vec  # (B, D')
+        elif feats.ndim == 4:
+            # (B, C, H, W) CNN features -> pooling + neck
+            x_vec = self.model.head.pool(feats).flatten(1)  # (B, C)
+            x_vec = self.model.head.neck(x_vec)  # (B, D')
+            return x_vec
+        elif feats.ndim == 2:
+            # Already (B, D)
+            return self.model.head.neck(feats)
+        else:
+            raise RuntimeError(f"Unsupported backbone features shape: {feats.shape}")
+
+    def _get_current_task_classifier(self):
+        return self.model.head.classifiers[self.current_task]  # nn.Linear(num_features, C_t)
+
+    #@torch.no_grad()
+    def eval_epoch(self, loader):
+        task_ranges = []
+        n_tasks = self.current_task + 1
+        for t in range(n_tasks):
+            s = task_ranges[-1][-1] + 1 if task_ranges else 0
+            e = s + self.datamodule.num_classes_of(t)
+            task_ranges.append(list(range(s, e)))
+
+        pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        for _, batch in enumerate(loader):
+            input, target = batch[:2]
+
+            # ---- Online ----
+            self.attach_pets(self.pets)
+            feat_on = self._encode_for_head(input)  # (B, D')
+            logits_on = self.model.head.classify(feat_on)  # (B, sumC)
+            pred_on.append(logits_on.argmax(dim=1))
+
+            # ---- Offline/EMA ----
+            if len(self.pets_emas) > 0:
+                self.attach_pets(self.pets_emas[0].module)
+                feat_off = self._encode_for_head(input)  # (B, D')
+                logits_off = self.model.head.classify(feat_off)  # (B, sumC)
+                pred_off.append(logits_off.argmax(dim=1))
+
+                # The linear classifier for the current task (used to compute w for GradNorm)
+                cur_clf = self._get_current_task_classifier()
+
+                # Weighted ensembling (returns probabilities, dimension = global sumC)
+                output = self.ood_factory.compute_ensemble(
+                    logits_on,  # (B, sumC) logits before softmax
+                    feat_on,  # (B, D')   online vector features
+                    logits_off,  # (B, sumC)
+                    cur_clf  # nn.Linear: classifier for the current task
+                )
+            else:
+                # Task 0: keep the same semantics as ensemble output (probabilities)
+                output = logits_on.softmax(dim=1)
+                pred_off.append(logits_on.argmax(dim=1))
+
+            # Restore PET
+            self.attach_pets(self.pets)
+
+            # ---- Metrics ----
+            self.val_acc.update(output, target)
+            for t in batch[2].long().unique().tolist():
+                sel = batch[2] == t
+                self.val_task_accs[t].update(output[sel], target[sel])
+
+                t_range = task_ranges[t]
+                output_local = output[sel][:, t_range]
+                target_local = target[sel] - t_range[0]
+                self.val_task_local_accs[t].update(output_local, target_local)
+
+            pred_ens.append(output.argmax(dim=1))
+            gts.append(target)
+
+        return pred_on, pred_off, pred_ens, gts
+
     def post_eval_epoch(self, result):
         super().post_eval_epoch()
         if self.current_task == 0 or not flags.FLAGS.debug:
@@ -272,10 +534,8 @@ class MyModule(Module):
         return super().configure_optimizer(self.model.head, self.pets)
 
 if __name__ == "__main__":
-    # 生成带时间的实验名称（便于区分）
     now_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # 初始化实验
     run = wandb.init(
         project="LAE",
         name=f"version0-20260103-256-5-cifar100",
@@ -287,9 +547,9 @@ if __name__ == "__main__":
             "dataset": "cifar100",
             "backbone": "ViT-B_16"
         },
-        tags=["baseline", "cifar100", "image-classification"],  # 标签（可选，用于筛选实验）
-        notes="ViT-B_16 cifar100 baseline",  # 实验说明（可选）
-        mode="online"  # 运行模式（online=实时同步，offline=本地存储，dryrun=调试不记录）
+        tags=["baseline", "cifar100", "image-classification"],
+        notes="ViT-B_16 cifar100 baseline",
+        mode="offline"  # run mode（online=realtime，offline=local，dryrun=nothing）
     )
 
     kwargs = dict(

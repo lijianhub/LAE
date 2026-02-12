@@ -3,7 +3,7 @@ accelerator: gpu
 strategy: null
 devices: 1
 num_nodes: 1
-precision: 32
+precision: 16
 benchmark: true
 deterministic: true
 checkpoint: null
@@ -20,9 +20,9 @@ data:
     num_samples_per_class: 0
     norm_feature: false
   dataloader:
-    batch_size: 24
+    batch_size: 256
     batch_size_val: 0
-    num_workers: 4
+    num_workers: 8
     pin_memory: true
     drop_last: true
   eval_on: seen

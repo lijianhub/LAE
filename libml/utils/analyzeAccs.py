@@ -257,5 +257,5 @@ def main(log_dir: str):
 
 
 if __name__ == "__main__":
-    LOG_DIRECTORY = r"C:\Users\40518\code\LAE\logs\cifar100\version_0"
+    LOG_DIRECTORY = r"C:\Users\40518\code\LAE\logs\vit_lora\version_0"
     main(LOG_DIRECTORY)

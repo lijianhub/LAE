@@ -276,6 +276,8 @@ class Module(ModuleABC):
         val_acc_pct_rounded = round(val_acc_pct, 2)
         global_task_acc_avg_rounded = round(global_task_acc_avg, 2)
 
+        # ToDo: add learning forgetting rate
+        # loss: 0.3238 accu
         wandb.log({
             "Evaluation/taskId": self.current_task,
             "Evaluation/Epoch": self.current_epoch,

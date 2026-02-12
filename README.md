@@ -3,6 +3,7 @@
 ```bash
 conda activate py310
 python main.py --config=vit_lora.yaml
+python main.py --config=cifar100.yaml
 pip install wandb
  wandb sync --sync-all
 ```
