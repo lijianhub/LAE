@@ -237,12 +237,18 @@ class MyModule(Module):
         pred_on, pred_off, pred_ens, gts = [], [], [], []
         for _, batch in enumerate(loader):
             input, target = batch[:2]
-            output, bs = self(input), input.shape[0]
+
+            # 1) Online forward happens first — with *current* PETs attached (online by default
+            output, bs = self(input), input.shape[0] # <- logits from the *online* expert right no
             pred_on.append(output.argmax(dim=1))
-            output_emas = [output.softmax(dim=1)]
+
+            # 2) Initialize the expert list with the *online* probability
+            output_emas = [output.softmax(dim=1)] # <- this is the ONLINE expert's probability
+
+            # 3) Now iterate over EMA experts: switch PETs, then forward to collect EMA probabilities
             for ema in self.pets_emas:
-                self.attach_pets(ema.module)
-                output_emas.append(self(input).softmax(dim=1))
+                self.attach_pets(ema.module) # <- switch to an EMA (offline) expert
+                output_emas.append(self(input).softmax(dim=1)) # <- EMA probability
 
             for oe in output_emas[1:]:
                 pred_off.append(oe.argmax(dim=1))
@@ -453,6 +459,111 @@ class MyModule(Module):
 
     def _get_current_task_classifier(self):
         return self.model.head.classifiers[self.current_task]  # nn.Linear(num_features, C_t)
+
+    def eval_epoch(self, loader):
+        """
+        Evaluate one epoch on the given loader using LAE-style online/offline experts
+        and OOD-aware gating (Energy/GradNorm/Hybrid) in probability space.
+
+        Returns
+        -------
+        pred_on  : list[Tensor], each tensor shape (B,), argmax from online logits
+        pred_off : list[Tensor], each tensor shape (B,), argmax from offline logits (or online mirror at Task 0)
+        pred_ens : list[Tensor], each tensor shape (B,), argmax from ensembled probabilities
+        gts      : list[Tensor], each tensor shape (B,), ground-truth labels (global class indices)
+        """
+        # 1) Build per-task global index ranges so we can compute local (task-wise) accuracy later.
+        task_ranges = []
+        n_tasks = self.current_task + 1
+        for t in range(n_tasks):
+            s = task_ranges[-1][-1] + 1 if task_ranges else 0  # start global class index of task t
+            e = s + self.datamodule.num_classes_of(t)  # end = start + num_classes(t)
+            task_ranges.append(list(range(s, e)))  # e.g., [[0..C0-1], [C0..C0+C1-1], ...]
+
+        # 2) Containers to collect per-batch predictions and ground truth.
+        pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        # 3) Iterate over data loader batches.
+        for _, batch in enumerate(loader):
+            # Unpack batch: inputs (images/tokens), targets (global class indices), and per-sample task IDs.
+            inputs, targets = batch[:2]
+            task_ids = batch[2].long()  # shape (B,), tells which task each sample belongs to
+
+            # ---- Online expert forward pass ----
+            # Attach the online PET(s) (e.g., Adapter/LoRA/Prefix) before encoding.
+            self.attach_pets(self.pets)
+            # Do not track gradients during inference for backbone/head forward.
+            with torch.no_grad():
+                # Encode inputs to the feature space expected by the classifier head.
+                feat_on = self._encode_for_head(inputs)  # shape (B, D')
+                # Produce global logits over all seen classes so far.
+                logits_on = self.model.head.classify(feat_on)  # shape (B, sumC)
+                # Save the online top-1 prediction.
+                pred_on.append(logits_on.argmax(dim=1))  # tensor (B,)
+
+            # ---- Offline/EMA expert path ----
+            if len(self.pets_emas) > 0:
+                # Attach the first EMA (offline) PET snapshot as the offline expert.
+                self.attach_pets(self.pets_emas[0].module)
+                with torch.no_grad():
+                    # Encode with EMA PET to get offline features and logits.
+                    feat_off = self._encode_for_head(inputs)  # shape (B, D')
+                    logits_off = self.model.head.classify(feat_off)  # shape (B, sumC)
+                    # Save the offline top-1 prediction (argmax over logits).
+                    pred_off.append(logits_off.argmax(dim=1))  # tensor (B,)
+
+                # Fetch the current-task linear classifier used inside GradNorm gating.
+                # Ensure it's on the same device as features and in eval mode (no BN/Dropout updates).
+                cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
+
+                # Compute the probability-space ensemble using the selected gating strategy.
+                # - gate: 'gradnorm' | 'energy' | 'hybrid'
+                # - T   : temperature for Energy/GradNorm scoring
+                # - two_stage: optional Energy->GradNorm refinement to save compute
+                output = self.ood_factory.compute_ensemble(
+                    logits_on=logits_on,  # online logits (B, sumC)
+                    feat_on=feat_on,  # online features for GradNorm (B, D')
+                    logits_off=logits_off,  # offline logits (B, sumC)
+                    head_on=cur_clf,  # current-task linear head for GradNorm
+                    gate=getattr(self.cfg, "gate", "gradnorm"),
+                    T=getattr(self.cfg, "ood_T", self.ood_factory.ood_T),
+                    two_stage=getattr(self.cfg, "two_stage", self.ood_factory.two_stage),
+                    return_logits=False  # return probabilities (for metrics)
+                )
+            else:
+                # Task 0 fallback: no EMA expert available.
+                # Keep probability semantics so downstream metrics remain consistent.
+                with torch.no_grad():
+                    output = torch.softmax(logits_on, dim=1)  # (B, sumC)
+                    # Mirror online predictions into pred_off to keep list lengths aligned.
+                    pred_off.append(logits_on.argmax(dim=1))  # (B,)
+
+            # Restore online PETs for the next batch iteration.
+            self.attach_pets(self.pets)
+
+            # ---- Metrics update (expects probabilities) ----
+            # Global accuracy over all seen classes.
+            self.val_acc.update(output, targets)  # output: (B, sumC), targets: (B,)
+
+            # Per-task metrics: both global and local (task subspace) accuracies.
+            for t in task_ids.unique().tolist():
+                sel = (task_ids == t)  # boolean mask for samples of task t
+                # Update per-task global accuracy using full-dim probabilities.
+                self.val_task_accs[t].update(output[sel], targets[sel])
+
+                # Slice probabilities to the local task subspace [task_ranges[t]],
+                # and shift targets to [0..num_classes_of(t)-1] for local softmax accuracy.
+                t_range = task_ranges[t]
+                output_local = output[sel][:, t_range]  # shape (b_t, C_t)
+                target_local = targets[sel] - t_range[0]  # shape (b_t,)
+                self.val_task_local_accs[t].update(output_local, target_local)
+
+            # Save ensemble top-1 predictions and ground truth for the epoch.
+            pred_ens.append(output.argmax(dim=1))  # (B,)
+            gts.append(targets)  # (B,)
+
+        # Return per-batch lists of predictions and ground truth.
+        return pred_on, pred_off, pred_ens, gts
 
     #@torch.no_grad()
     def eval_epoch(self, loader):
