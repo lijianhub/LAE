@@ -512,6 +512,17 @@ class MyModule(Module):
                     # Save the offline top-1 prediction (argmax over logits).
                     pred_off.append(logits_off.argmax(dim=1))  # tensor (B,)
 
+                # After you compute logits_on and logits_off (and have an EMA expert):
+                if hasattr(self, "val_acc_lae"):
+                    p_lae = self.ood_factory.lae_per_class_max(logits_on, logits_off, renorm=True)
+                    self.val_acc_lae.update(p_lae, targets)
+
+                    # If you also track per-task LAE metrics, slice them exactly as you do for 'output'
+                    # sel = (task_ids == t)
+                    # output_local_lae = p_lae[sel][:, t_range]
+                    # self.val_task_accs_lae[t].update(p_lae[sel], targets[sel])
+                    # self.val_task_local_accs_lae[t].update(output_local_lae, target_local)
+
                 # Fetch the current-task linear classifier used inside GradNorm gating.
                 # Ensure it's on the same device as features and in eval mode (no BN/Dropout updates).
                 cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
