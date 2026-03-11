@@ -24,14 +24,24 @@ from ood.GeneralizedOODFactory import GeneralizedOODFactory
 
 @dataclass
 class MyModuleConf(ModuleConf):
-    adapt_blocks: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
-    pet_cls: str = "Adapter"  # enum: Adapter, LoRA, Prefix
-    pet_kwargs: Dict[str, Any] = field(default_factory=lambda: {})
-    num_emas: int = 1
-    ema_decay: float = 0.9999
-    num_freeze_epochs: int = 3
-    eval_only_emas: bool = False
+     adapt_blocks: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+     pet_cls: str = "Adapter"  # enum: Adapter, LoRA, Prefix
+     pet_kwargs: Dict[str, Any] = field(default_factory=lambda: {})
+     num_emas: int = 1
+     ema_decay: float = 0.9999
+     num_freeze_epochs: int = 3
+     eval_only_emas: bool = False
+     # ==== OOD gating / ensembling ====
+     gate: str = "hybrid"  # "energy" | "gradnorm" | "hybrid"
+     ood_T: float = 1.0  # temperature for Energy/GradNorm
+     two_stage: bool = True  # enable Energy->GradNorm two-stage refinement
+     two_stage_low_q: float = 0.2  # low quantile for two-stage band
+     two_stage_high_q: float = 0.8  # high quantile for two-stage band
+     two_stage_band: str = "w"  # "w" or "Eon"
+     hybrid_alpha: float = 0.7  # mixing factor for hybrid gating
 
+     # Grid evaluation of gating hyperparameters (from YAML: module.eval_sweeps)
+     eval_sweeps: dict = field(default_factory=lambda: {})
 
 @dataclass
 class MyConf(Conf):
@@ -283,142 +293,6 @@ class MyModule(Module):
         logits = self.model.head(feats)
         return logits, feats
 
-    def eval_epoch_v1(self, loader):
-        task_ranges = []
-        n_tasks = self.current_task + 1
-        for t in range(n_tasks):
-            s = task_ranges[-1][-1] + 1 if task_ranges else 0
-            e = s + self.datamodule.num_classes_of(t)
-            task_ranges.append(list(range(s, e)))
-
-        pred_on, pred_off, pred_ens, gts = [], [], [], []
-
-        for _, batch in enumerate(loader):
-            input, target = batch[:2]
-
-            # 1. Forward Online (Learning Module)
-            # We need both logits and features for GradNorm
-            self.attach_pets(self.pets)
-            logits_on, features = self._backbone_logits_and_features(input)
-            logits_on = self.model.head(logits_on)
-            pred_on.append(logits_on.argmax(dim=1))
-
-            # 2. Forward Offline (Accumulation Module)
-            # We assume the first EMA in pets_emas is the primary stable expert
-            if len(self.pets_emas) > 0:
-                self.attach_pets(self.pets_emas[0].module)
-                logits_off = self.model(input)
-                pred_off.append(logits_off.argmax(dim=1))
-
-                # 3. Decision via GradNorm Factory (Ensemble Module)
-                # Uses 3.1.3 logic to calculate weight 'w' and combine experts
-                output = self.ood_factory.compute_ensemble(
-                    logits_on,
-                    features,
-                    logits_off,
-                    self.model.head[-1]  # Pass the current task head
-                )
-            else:
-                # Case for Task 0 (No EMAs yet)
-                output = logits_on.softmax(dim=1)
-                pred_off.append(logits_on.argmax(dim=1))
-
-            # Reset PETs to Online for safe state management
-            self.attach_pets(self.pets)
-
-            # 4. Standard Metrics and Bookkeeping
-            self.val_acc.update(output, target)
-            for t in batch[2].long().unique().tolist():
-                sel = batch[2] == t
-                self.val_task_accs[t].update(output[sel], target[sel])
-
-                t_range = task_ranges[t]
-                output_local = output[sel][:, t_range]
-                target_local = target[sel] - t_range[0]
-                self.val_task_local_accs[t].update(output_local, target_local)
-
-            pred_ens.append(output.argmax(dim=1))
-            gts.append(target)
-
-        return pred_on, pred_off, pred_ens, gts
-
-    # Define a head function for the "current task"
-    def head_fn(self, feats):
-        # Most Dynamic*Head modules will route to the corresponding head
-        # based on self.current_task. If its forward() requires a task_id,
-        # we pass it in.
-        try:
-            return self.model.head(feats, task_id=self.current_task)
-        except TypeError:
-            # If it doesn't require task_id, just forward normally
-            return self.model.head(feats)
-
-    def eval_epoch_v2(self, loader):
-        task_ranges = []
-        n_tasks = self.current_task + 1
-        for t in range(n_tasks):
-            s = task_ranges[-1][-1] + 1 if task_ranges else 0
-            e = s + self.datamodule.num_classes_of(t)
-            task_ranges.append(list(range(s, e)))
-
-        pred_on, pred_off, pred_ens, gts = [], [], [], []
-
-        for _, batch in enumerate(loader):
-            input, target = batch[:2]
-
-            # 1. Forward Online (Learning Module)
-            self.attach_pets(self.pets)
-
-            bb = self.model.backbone
-            if hasattr(bb, "forward_features"):
-                features = bb.forward_features(input)
-            elif hasattr(bb, "get_intermediate_layers"):
-                tmp = bb.get_intermediate_layers(input, n=1)[-1]
-                features = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
-            else:
-                raise RuntimeError("Backbone must expose forward_features or get_intermediate_layers.")
-
-            logits_on = self.model.head(features)
-            pred_on.append(logits_on.argmax(dim=1))
-
-            # 2. Forward Offline (Accumulation Module)
-            if len(self.pets_emas) > 0:
-                self.attach_pets(self.pets_emas[0].module)
-                logits_off = self.model(input)
-                pred_off.append(logits_off.argmax(dim=1))
-
-                # 3. Ensemble via OOD Factory
-                output = self.ood_factory.compute_ensemble(
-                    logits_on,
-                    features,
-                    logits_off,
-                    self.head_fn
-                )
-            else:
-                # Task 0（no EMA）
-                #Need softmax
-                output = logits_on.softmax(dim=1)
-                pred_off.append(logits_on.argmax(dim=1))
-
-            # Reset PETs
-            self.attach_pets(self.pets)
-
-            # 4. Metrics
-            self.val_acc.update(output, target)
-            for t in batch[2].long().unique().tolist():
-                sel = batch[2] == t
-                self.val_task_accs[t].update(output[sel], target[sel])
-
-                t_range = task_ranges[t]
-                output_local = output[sel][:, t_range]
-                target_local = target[sel] - t_range[0]
-                self.val_task_local_accs[t].update(output_local, target_local)
-
-            pred_ens.append(output.argmax(dim=1))
-            gts.append(target)
-
-        return pred_on, pred_off, pred_ens, gts
-
     def _encode_for_head(self, x):
         """
         Returns the vector features (B, D) fed into DynamicSimpleHead.classify(...).
@@ -460,124 +334,17 @@ class MyModule(Module):
     def _get_current_task_classifier(self):
         return self.model.head.classifiers[self.current_task]  # nn.Linear(num_features, C_t)
 
+    # Keep @torch.no_grad() at evaluate() level; do NOT use inference_mode() here.
     def eval_epoch(self, loader):
         """
-        Evaluate one epoch on the given loader using LAE-style online/offline experts
-        and OOD-aware gating (Energy/GradNorm/Hybrid) in probability space.
-
-        Returns
-        -------
-        pred_on  : list[Tensor], each tensor shape (B,), argmax from online logits
-        pred_off : list[Tensor], each tensor shape (B,), argmax from offline logits (or online mirror at Task 0)
-        pred_ens : list[Tensor], each tensor shape (B,), argmax from ensembled probabilities
-        gts      : list[Tensor], each tensor shape (B,), ground-truth labels (global class indices)
+        Evaluate one epoch using online/offline experts and OOD-aware gating.
+        This version removes inference_mode() so GradNorm can compute gradients safely,
+        records rich artifacts, and is robust to no-EMA cases.
         """
-        # 1) Build per-task global index ranges so we can compute local (task-wise) accuracy later.
-        task_ranges = []
-        n_tasks = self.current_task + 1
-        for t in range(n_tasks):
-            s = task_ranges[-1][-1] + 1 if task_ranges else 0  # start global class index of task t
-            e = s + self.datamodule.num_classes_of(t)  # end = start + num_classes(t)
-            task_ranges.append(list(range(s, e)))  # e.g., [[0..C0-1], [C0..C0+C1-1], ...]
 
-        # 2) Containers to collect per-batch predictions and ground truth.
-        pred_on, pred_off, pred_ens, gts = [], [], [], []
-
-        # 3) Iterate over data loader batches.
-        for _, batch in enumerate(loader):
-            # Unpack batch: inputs (images/tokens), targets (global class indices), and per-sample task IDs.
-            inputs, targets = batch[:2]
-            task_ids = batch[2].long()  # shape (B,), tells which task each sample belongs to
-
-            # ---- Online expert forward pass ----
-            # Attach the online PET(s) (e.g., Adapter/LoRA/Prefix) before encoding.
-            self.attach_pets(self.pets)
-            # Do not track gradients during inference for backbone/head forward.
-            with torch.no_grad():
-                # Encode inputs to the feature space expected by the classifier head.
-                feat_on = self._encode_for_head(inputs)  # shape (B, D')
-                # Produce global logits over all seen classes so far.
-                logits_on = self.model.head.classify(feat_on)  # shape (B, sumC)
-                # Save the online top-1 prediction.
-                pred_on.append(logits_on.argmax(dim=1))  # tensor (B,)
-
-            # ---- Offline/EMA expert path ----
-            if len(self.pets_emas) > 0:
-                # Attach the first EMA (offline) PET snapshot as the offline expert.
-                self.attach_pets(self.pets_emas[0].module)
-                with torch.no_grad():
-                    # Encode with EMA PET to get offline features and logits.
-                    feat_off = self._encode_for_head(inputs)  # shape (B, D')
-                    logits_off = self.model.head.classify(feat_off)  # shape (B, sumC)
-                    # Save the offline top-1 prediction (argmax over logits).
-                    pred_off.append(logits_off.argmax(dim=1))  # tensor (B,)
-
-                # After you compute logits_on and logits_off (and have an EMA expert):
-                if hasattr(self, "val_acc_lae"):
-                    p_lae = self.ood_factory.lae_per_class_max(logits_on, logits_off, renorm=True)
-                    self.val_acc_lae.update(p_lae, targets)
-
-                    # If you also track per-task LAE metrics, slice them exactly as you do for 'output'
-                    # sel = (task_ids == t)
-                    # output_local_lae = p_lae[sel][:, t_range]
-                    # self.val_task_accs_lae[t].update(p_lae[sel], targets[sel])
-                    # self.val_task_local_accs_lae[t].update(output_local_lae, target_local)
-
-                # Fetch the current-task linear classifier used inside GradNorm gating.
-                # Ensure it's on the same device as features and in eval mode (no BN/Dropout updates).
-                cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
-
-                # Compute the probability-space ensemble using the selected gating strategy.
-                # - gate: 'gradnorm' | 'energy' | 'hybrid'
-                # - T   : temperature for Energy/GradNorm scoring
-                # - two_stage: optional Energy->GradNorm refinement to save compute
-                output = self.ood_factory.compute_ensemble(
-                    logits_on=logits_on,  # online logits (B, sumC)
-                    feat_on=feat_on,  # online features for GradNorm (B, D')
-                    logits_off=logits_off,  # offline logits (B, sumC)
-                    head_on=cur_clf,  # current-task linear head for GradNorm
-                    gate=getattr(self.cfg, "gate", "gradnorm"),
-                    T=getattr(self.cfg, "ood_T", self.ood_factory.ood_T),
-                    two_stage=getattr(self.cfg, "two_stage", self.ood_factory.two_stage),
-                    return_logits=False  # return probabilities (for metrics)
-                )
-            else:
-                # Task 0 fallback: no EMA expert available.
-                # Keep probability semantics so downstream metrics remain consistent.
-                with torch.no_grad():
-                    output = torch.softmax(logits_on, dim=1)  # (B, sumC)
-                    # Mirror online predictions into pred_off to keep list lengths aligned.
-                    pred_off.append(logits_on.argmax(dim=1))  # (B,)
-
-            # Restore online PETs for the next batch iteration.
-            self.attach_pets(self.pets)
-
-            # ---- Metrics update (expects probabilities) ----
-            # Global accuracy over all seen classes.
-            self.val_acc.update(output, targets)  # output: (B, sumC), targets: (B,)
-
-            # Per-task metrics: both global and local (task subspace) accuracies.
-            for t in task_ids.unique().tolist():
-                sel = (task_ids == t)  # boolean mask for samples of task t
-                # Update per-task global accuracy using full-dim probabilities.
-                self.val_task_accs[t].update(output[sel], targets[sel])
-
-                # Slice probabilities to the local task subspace [task_ranges[t]],
-                # and shift targets to [0..num_classes_of(t)-1] for local softmax accuracy.
-                t_range = task_ranges[t]
-                output_local = output[sel][:, t_range]  # shape (b_t, C_t)
-                target_local = targets[sel] - t_range[0]  # shape (b_t,)
-                self.val_task_local_accs[t].update(output_local, target_local)
-
-            # Save ensemble top-1 predictions and ground truth for the epoch.
-            pred_ens.append(output.argmax(dim=1))  # (B,)
-            gts.append(targets)  # (B,)
-
-        # Return per-batch lists of predictions and ground truth.
-        return pred_on, pred_off, pred_ens, gts
-
-    #@torch.no_grad()
-    def eval_epoch(self, loader):
+        # -----------------------------
+        # Build per-task global ranges
+        # -----------------------------
         task_ranges = []
         n_tasks = self.current_task + 1
         for t in range(n_tasks):
@@ -585,44 +352,104 @@ class MyModule(Module):
             e = s + self.datamodule.num_classes_of(t)
             task_ranges.append(list(range(s, e)))
 
+        # -----------------------------
+        # Return lists (kept for debug)
+        # -----------------------------
         pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        # -----------------------------
+        # Per-epoch caches for metrics
+        # -----------------------------
+        self._last_eval = {
+            "probs": [],  # list[(B, C)]
+            "targets": [],  # list[(B,)]
+            "preds": [],  # list[(B,)]
+            "weights": [],  # optional list[(B,)] if you expose gating weights
+            "logits_on": [],  # list[(B, C)]
+            "logits_off": []  # list[(B, C)]
+        }
+
+        # -----------------------------
+        # Resolve ensemble configuration
+        # -----------------------------
+        gate_cfg = getattr(self.cfg, "gate", "hybrid")
+        T_cfg = getattr(self.cfg, "ood_T", self.ood_factory.ood_T)
+        two_stage_cfg = getattr(self.cfg, "two_stage", self.ood_factory.two_stage)
+        low_q = getattr(self.cfg, "two_stage_low_q", self.ood_factory.two_stage_low_q)
+        high_q = getattr(self.cfg, "two_stage_high_q", self.ood_factory.two_stage_high_q)
+        band = getattr(self.cfg, "two_stage_band", "w")
+        alpha = getattr(self.cfg, "hybrid_alpha", self.ood_factory.hybrid_alpha)
+
+        # -----------------------------
+        # Evaluation loop (no inference_mode)
+        # -----------------------------
+        self.model.eval()
 
         for _, batch in enumerate(loader):
             input, target = batch[:2]
 
-            # ---- Online ----
-            self.attach_pets(self.pets)
-            feat_on = self._encode_for_head(input)  # (B, D')
-            logits_on = self.model.head.classify(feat_on)  # (B, sumC)
-            pred_on.append(logits_on.argmax(dim=1))
+            # Always restore online PETs on exit
+            try:
+                # ---- Online forward ----
+                self.attach_pets(self.pets)  # online PETs
+                feat_on = self._encode_for_head(input)  # (B, D')
+                logits_on = self.model.head.classify(feat_on)  # (B, sumC)
+                pred_on.append(logits_on.argmax(dim=1))
 
-            # ---- Offline/EMA ----
-            if len(self.pets_emas) > 0:
-                self.attach_pets(self.pets_emas[0].module)
-                feat_off = self._encode_for_head(input)  # (B, D')
-                logits_off = self.model.head.classify(feat_off)  # (B, sumC)
-                pred_off.append(logits_off.argmax(dim=1))
+                # ---- EMA/offline forward (if any) ----
+                has_offline = len(self.pets_emas) > 0
+                if has_offline:
+                    self.attach_pets(self.pets_emas[0].module)  # switch to the first EMA
+                    feat_off = self._encode_for_head(input)  # (B, D')
+                    logits_off = self.model.head.classify(feat_off)  # (B, sumC)
+                    pred_off.append(logits_off.argmax(dim=1))
 
-                # The linear classifier for the current task (used to compute w for GradNorm)
-                cur_clf = self._get_current_task_classifier()
+                    # Optional: LAE Eq.(14) baseline
+                    if hasattr(self, "val_acc_lae") and hasattr(self.ood_factory, "lae_per_class_max"):
+                        p_lae = self.ood_factory.lae_per_class_max(logits_on, logits_off, renorm=True)
+                        self.val_acc_lae.update(p_lae, target)
 
-                # Weighted ensembling (returns probabilities, dimension = global sumC)
-                output = self.ood_factory.compute_ensemble(
-                    logits_on,  # (B, sumC) logits before softmax
-                    feat_on,  # (B, D')   online vector features
-                    logits_off,  # (B, sumC)
-                    cur_clf  # nn.Linear: classifier for the current task
-                )
-            else:
-                # Task 0: keep the same semantics as ensemble output (probabilities)
-                output = logits_on.softmax(dim=1)
-                pred_off.append(logits_on.argmax(dim=1))
+                    # Current-task classifier for GradNorm
+                    cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
 
-            # Restore PET
-            self.attach_pets(self.pets)
+                    # OOD-aware weighted ensembling (probability space)
+                    out = self.ood_factory.compute_ensemble(
+                        logits_on=logits_on,
+                        feat_on=feat_on,
+                        logits_off=logits_off,
+                        head_on=cur_clf,
+                        gate=gate_cfg,
+                        T=T_cfg,
+                        two_stage=two_stage_cfg,
+                        energy_quantiles=(low_q, high_q),
+                        hybrid_alpha=alpha,
+                        two_stage_band=band,
+                        return_logits=False,
+                    )
+                    output = out  # probs (B, C)
 
-            # ---- Metrics ----
+                    # (Optional) keep logits for gating AUC diagnostics
+                    self._last_eval["logits_on"].append(logits_on.detach())
+                    self._last_eval["logits_off"].append(logits_off.detach())
+
+                else:
+                    # Task 0: no EMA expert; use online probabilities
+                    output = torch.softmax(logits_on, dim=1)
+                    pred_off.append(logits_on.argmax(dim=1))
+
+            finally:
+                # Always restore online PETs before metric accounting
+                self.attach_pets(self.pets)
+
+            # ---------------------
+            # Global metrics
+            # ---------------------
             self.val_acc.update(output, target)
+
+            # ---------------------
+            # Local (task-subspace) metrics
+            # ---------------------
+            # batch[2] is task id per sample
             for t in batch[2].long().unique().tolist():
                 sel = batch[2] == t
                 self.val_task_accs[t].update(output[sel], target[sel])
@@ -632,10 +459,171 @@ class MyModule(Module):
                 target_local = target[sel] - t_range[0]
                 self.val_task_local_accs[t].update(output_local, target_local)
 
+            # ---------------------
+            # Records for external benchmark
+            # ---------------------
             pred_ens.append(output.argmax(dim=1))
             gts.append(target)
+            self._last_eval["probs"].append(output.detach())
+            self._last_eval["targets"].append(target.detach())
+            self._last_eval["preds"].append(output.argmax(dim=1).detach())
+            # If later compute_ensemble exposes gating weights 'w':
+            # self._last_eval["weights"].append(w.detach())
 
+        # Return sequences for optional downstream analysis / saving
         return pred_on, pred_off, pred_ens, gts
+
+    # @torch.no_grad()   # keep grads disabled only where needed
+    def eval_epoch_v3(self, loader):
+        """
+        Evaluate one epoch using online/offline experts and OOD-aware gating.
+        This version reduces overhead, records richer artifacts, and is robust to no-EMA cases.
+        """
+
+        # -----------------------------
+        # Build per-task global ranges
+        # -----------------------------
+        task_ranges = []
+        n_tasks = self.current_task + 1
+        for t in range(n_tasks):
+            s = task_ranges[-1][-1] + 1 if task_ranges else 0
+            e = s + self.datamodule.num_classes_of(t)
+            task_ranges.append(list(range(s, e)))
+
+        # -----------------------------
+        # Return lists (kept for debug)
+        # -----------------------------
+        pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        # -----------------------------
+        # Per-epoch caches for metrics
+        # -----------------------------
+        self._last_eval = {
+            "probs": [],  # list[(B, C)]
+            "targets": [],  # list[(B,)]
+            "preds": [],  # list[(B,)]
+            "weights": [],  # optional list[(B,)] if you expose gating weights
+            "logits_on": [],  # list[(B, C)]
+            "logits_off": []  # list[(B, C)]
+        }
+
+        # -----------------------------
+        # Resolve ensemble configuration
+        # -----------------------------
+        gate_cfg = getattr(self.cfg, "gate", "hybrid")
+        T_cfg = getattr(self.cfg, "ood_T", self.ood_factory.ood_T)
+        two_stage_cfg = getattr(self.cfg, "two_stage", self.ood_factory.two_stage)
+        low_q = getattr(self.cfg, "two_stage_low_q", self.ood_factory.two_stage_low_q)
+        high_q = getattr(self.cfg, "two_stage_high_q", self.ood_factory.two_stage_high_q)
+        band = getattr(self.cfg, "two_stage_band", "w")
+        alpha = getattr(self.cfg, "hybrid_alpha", self.ood_factory.hybrid_alpha)
+
+        # -----------------------------
+        # Evaluation loop (no autograd)
+        # -----------------------------
+        # Use inference_mode to avoid autograd state and get best eval throughput.
+        with torch.inference_mode():
+            # Ensure model in eval mode for eval epoch
+            self.model.eval()
+
+            for _, batch in enumerate(loader):
+                input, target = batch[:2]
+
+                # We must guarantee PET restore on exit
+                try:
+                    # ---- Online forward ----
+                    self.attach_pets(self.pets)  # online PETs
+                    feat_on = self._encode_for_head(input)  # (B, D')
+                    logits_on = self.model.head.classify(feat_on)  # (B, sumC)
+                    pred_on.append(logits_on.argmax(dim=1))
+
+                    # ---- EMA/offline forward (if any) ----
+                    has_offline = len(self.pets_emas) > 0
+                    if has_offline:
+                        self.attach_pets(self.pets_emas[0].module)  # switch to the first EMA
+                        feat_off = self._encode_for_head(input)  # (B, D')
+                        logits_off = self.model.head.classify(feat_off)  # (B, sumC)
+                        pred_off.append(logits_off.argmax(dim=1))
+
+                        # Optional: LAE Eq.(14) baseline
+                        if hasattr(self, "val_acc_lae") and hasattr(self.ood_factory, "lae_per_class_max"):
+                            p_lae = self.ood_factory.lae_per_class_max(logits_on, logits_off, renorm=True)
+                            self.val_acc_lae.update(p_lae, target)
+
+                        # Current-task classifier for GradNorm
+                        cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
+
+                        # OOD-aware weighted ensembling (probability space)
+                        # If in the future compute_ensemble returns (probs, w), keep the branch below.
+                        out = self.ood_factory.compute_ensemble(
+                            logits_on=logits_on,
+                            feat_on=feat_on,
+                            logits_off=logits_off,
+                            head_on=cur_clf,
+                            gate=gate_cfg,
+                            T=T_cfg,
+                            two_stage=two_stage_cfg,
+                            energy_quantiles=(low_q, high_q),
+                            hybrid_alpha=alpha,
+                            two_stage_band=band,
+                            return_logits=False,
+                        )
+                        output = out  # probs (B, C)
+
+                        # (Optional) keep logits for gating AUC diagnostics
+                        self._last_eval["logits_on"].append(logits_on.detach())
+                        self._last_eval["logits_off"].append(logits_off.detach())
+
+                    else:
+                        # Task 0: no EMA expert; use online probabilities
+                        output = torch.softmax(logits_on, dim=1)
+                        pred_off.append(logits_on.argmax(dim=1))
+
+                finally:
+                    # Always restore online PETs before metric accounting
+                    self.attach_pets(self.pets)
+
+                # ---------------------
+                # Global metrics
+                # ---------------------
+                self.val_acc.update(output, target)
+
+                # ---------------------
+                # Local (task-subspace) metrics
+                # ---------------------
+                # batch[2] is task id per sample
+                for t in batch[2].long().unique().tolist():
+                    sel = batch[2] == t
+                    self.val_task_accs[t].update(output[sel], target[sel])
+
+                    t_range = task_ranges[t]
+                    output_local = output[sel][:, t_range]
+                    target_local = target[sel] - t_range[0]
+                    self.val_task_local_accs[t].update(output_local, target_local)
+
+                # ---------------------
+                # Records for external benchmark
+                # ---------------------
+                pred_ens.append(output.argmax(dim=1))
+                gts.append(target)
+                self._last_eval["probs"].append(output.detach())
+                self._last_eval["targets"].append(target.detach())
+                self._last_eval["preds"].append(output.argmax(dim=1).detach())
+                # If later compute_ensemble exposes gating weights 'w':
+                # self._last_eval["weights"].append(w.detach())
+
+            # Return sequences for optional downstream analysis / saving
+            return pred_on, pred_off, pred_ens, gts
+
+    def get_last_epoch_outputs(self):
+        """
+        Return a dict of last-epoch outputs recorded in eval_epoch for external metrics:
+            probs, targets, preds, weights (optional), logits_on/off (optional)
+        """
+        out = getattr(self, "_last_eval", None)
+        if out is None:
+            return {"probs": [], "targets": [], "preds": [], "weights": [], "logits_on": [], "logits_off": []}
+        return out
 
     def post_eval_epoch(self, result):
         super().post_eval_epoch()

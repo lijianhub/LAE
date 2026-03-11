@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import logging
 
 class GeneralizedOODFactory(nn.Module):
     """
@@ -211,6 +211,22 @@ class GeneralizedOODFactory(nn.Module):
           - Use quantiles of w_energy to define the middle band (posterior ~ 0.5).
           - Optionally set 'Eon' to reuse E_on quantiles (legacy behavior).
         """
+        # Log once to avoid noisy output on every batch
+        #if not hasattr(self, "_logged_ensemble_cfg"):
+        #    self._logged_ensemble_cfg = False
+        #if not self._logged_ensemble_cfg:
+        """
+            lq = (energy_quantiles[0] if energy_quantiles is not None else self.two_stage_low_q)
+            hq = (energy_quantiles[1] if energy_quantiles is not None else self.two_stage_high_q)
+            logging.info(
+                "[OODFactory] compute_ensemble -> gate=%s | T=%.6f | two_stage=%s | "
+                "low_q=%.3f | high_q=%.3f | band=%s | alpha=%.3f",
+                str(gate), float(T), str(two_stage),
+                float(lq), float(hq), str(two_stage_band), float(hybrid_alpha),
+            )
+            #self._logged_ensemble_cfg = True
+        """
+
         if T is None:
             T = self.ood_T
         if two_stage is None:
@@ -283,18 +299,18 @@ class GeneralizedOODFactory(nn.Module):
         return p
 
     @torch.no_grad()
-    def lae_per_class_max(logits_on: torch.Tensor,
+    def lae_per_class_max(self, logits_on: torch.Tensor,
                           logits_off: torch.Tensor,
                           renorm: bool = True) -> torch.Tensor:
         """
-        LAE inference baseline (Eq.(14)): per-class max after softmax.
-        Returns a probability vector; renorm=True is recommended for NLL/ECE.
+        LAE baseline (Eq.(14)): per-class max after softmax.
+        Returns a probability vector; enabling renorm is recommended for NLL/ECE.
         """
         if logits_on.shape != logits_off.shape:
             raise ValueError(f"Shape mismatch: {logits_on.shape} vs {logits_off.shape}")
         p_on = F.softmax(logits_on, dim=1)
         p_off = F.softmax(logits_off, dim=1)
-        p_max = torch.maximum(p_on, p_off)  # per-class max
+        p_max = torch.maximum(p_on, p_off)
         if renorm:
             p_max = p_max / p_max.sum(dim=1, keepdim=True).clamp_min(1e-12)
         return p_max

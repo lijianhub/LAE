@@ -20,17 +20,41 @@ data:
     num_samples_per_class: 0
     norm_feature: false
   dataloader:
-    batch_size: 24
+    batch_size: 4
     batch_size_val: 0
-    num_workers: 4
+    num_workers: 8
     pin_memory: true
     drop_last: true
   eval_on: seen
   val_split_ratio: 0.0
   train_val_split_seed: 42
 module:
-  current_epoch: 0
-  num_epochs: 3
+  # ===== Base defaults =====
+  gate: hybrid
+  ood_T: 0.9
+  two_stage: true
+  two_stage_low_q: 0.2
+  two_stage_high_q: 0.8
+  two_stage_band: w
+  hybrid_alpha: 0.6
+
+  # ===== Evaluation sweeps =====
+  eval_sweeps:
+    # --- Group 1: Main gating strategy ---
+    gate: ["energy", "hybrid", "gradnorm"]
+    # --- Group 2: OOD temperature T ---
+    ood_T: [0.5, 1.0]
+    # --- Group 3: Hybrid mixture coefficient ---
+    hybrid_alpha: [0.3, 0.7]
+    # --- Group 4: two-stage refinement ---
+    #two_stage: [false, true]
+    #two_stage_low_q:  [0.1, 0.2]
+    #two_stage_high_q: [0.7, 0.8]
+    #two_stage_band: ["w", "Eon"]
+    # --- (Optional) Group 5: EMA count or decay ---
+    # num_emas: [1]      # CIFAR-100 任务里 1 个 EMA 已足够稳定
+    # ema_decay: [0.999, 0.9999]
+
   model:
     backbone: ViT-B_16
     backbone_kwargs: {}

@@ -166,6 +166,17 @@ class Module(ModuleABC):
             loader_train = self.datamodule.train_dataloader(**kwargs)
             self.datamodule.memory.update(model, loader_train)
 
+        # === Evaluate hyperparameter sweeps at the very end (if configured) ===
+        try:
+            sweeps = getattr(self.cfg, 'eval_sweeps', None)
+            if sweeps is not None:
+                from omegaconf import OmegaConf as oc
+                sweeps_dict = oc.to_container(sweeps, resolve=True)
+                if isinstance(sweeps_dict, dict) and len(sweeps_dict) > 0:
+                    self.evaluate_sweeps(getattr(self, 'val_loader', None))
+        except Exception as e:
+            logging.error(f'Failed to run eval_sweeps: {e}')
+
     def train_epoch(self, loader, num_batches):
         nt = len(str(self.datamodule.scenario_train.nb_tasks - 1))
         ne = len(str(self.cfg.num_epochs - 1))
@@ -241,6 +252,80 @@ class Module(ModuleABC):
     def post_eval_epoch(self, *_):
         self.model.train()
 
+    def _iter_eval_sweep_combos(self):
+        """Yield dicts of all combinations in cfg.eval_sweeps (cartesian product).
+        Returns [] if no sweeps configured.
+        """
+        from itertools import product
+        sweeps = getattr(self.cfg, 'eval_sweeps', None)
+        try:
+            from omegaconf import OmegaConf as oc
+        except Exception:
+            oc = None
+        if sweeps is None or (hasattr(sweeps, '__len__') and len(sweeps) == 0):
+            return []
+        # Convert OmegaConf -> Python dict
+        if oc is not None:
+            sweeps = oc.to_container(sweeps, resolve=True)
+        keys = list(sweeps.keys())
+        vals = [sweeps[k] for k in keys]
+        vals = [v if isinstance(v, (list, tuple)) else [v] for v in vals]
+        for combo_vals in product(*vals):
+            yield dict(zip(keys, combo_vals))
+
+    def _format_combo_label(self, combo: dict) -> str:
+        # Build a compact label that will appear in console and W&B
+        def g(k, default):
+            return combo.get(k, getattr(self.cfg, k, default))
+        gate = g('gate', 'hybrid')
+        T = g('ood_T', 1.0)
+        alpha = g('hybrid_alpha', 0.7)
+        two = g('two_stage', True)
+        low = g('two_stage_low_q', 0.2)
+        high = g('two_stage_high_q', 0.8)
+        band = g('two_stage_band', 'w')
+        return f"gate={gate}|T={T}|alpha={alpha}|two={two}|q={low}-{high}|band={band}"
+
+    @torch.no_grad()
+    def evaluate_sweeps(self, loader: DataLoader = None):
+        """Run evaluation over all cartesian combinations of module.eval_sweeps.
+        Logs an identifying label per combo and emits W&B fields under the prefix 'EvalSweep/'.
+        """
+        combos = list(self._iter_eval_sweep_combos())
+        if not combos:
+            return
+        loader = self.val_loader if loader is None else loader
+
+        # Stash original cfg values we will override
+        keys = sorted({k for c in combos for k in c.keys()})
+        orig = {k: getattr(self.cfg, k, None) for k in keys}
+
+        logging.info(f"==> EvalSweeps: {len(combos)} combinations to evaluate …")
+        for i, combo in enumerate(combos, 1):
+            # Apply override for this combo
+            for k, v in combo.items():
+                setattr(self.cfg, k, v)
+            label = self._format_combo_label(combo)
+            logging.info(f"==> [SWEEP {i}/{len(combos)}] {label}")
+
+            # Prefer evaluate_v2 (更多指标); fallback evaluate
+            eval_fn = getattr(self, 'evaluate_v2', None) or getattr(self, 'evaluate', None)
+            eval_fn(loader)
+
+            # Emit sweep-identifying fields to W&B
+            sweep_log = {f"EvalSweep/{k}": v for k, v in combo.items()}
+            sweep_log["EvalSweep/label"] = label
+            sweep_log["EvalSweep/index"] = i
+            try:
+                wandb.log(sweep_log)
+            except Exception:
+                pass
+
+        # Restore original config
+        for k, v in orig.items():
+            setattr(self.cfg, k, v)
+        logging.info("==> EvalSweeps: completed and restored base config.")
+
     @torch.no_grad()
     def evaluate(self, loader: DataLoader = None):
         loader = self.val_loader if loader is None else loader
@@ -285,6 +370,137 @@ class Module(ModuleABC):
             "Evaluation/GlobalPerTaskAccs": render(self.val_task_accs),
             "Evaluation/GlobalTaskAccsAvg(%)": global_task_acc_avg_rounded,  # 已格式化的数值
             "Evaluation/LocalPerTaskAccs": render(self.val_task_local_accs)
+        })
+
+    @torch.no_grad()
+    def evaluate_v2(self, loader: DataLoader = None):
+        """
+        Full evaluation for one epoch.
+        - Keeps your existing global/per-task metrics.
+        - Adds optional NLL/ECE/Brier/SwitchRate and (if available) gating AUC/PR.
+        - Logs both console and W&B.
+        """
+        # Prepare loader
+        loader = self.val_loader if loader is None else loader
+        loader = self.trainer.setup_dataloaders(loader)
+
+        # Reset public metrics you already maintain
+        self.val_acc.reset()
+        _ = [acc.reset() for acc in self.val_task_accs]
+        _ = [acc.reset() for acc in self.val_task_local_accs]
+
+        # Forward evaluation pass (your eval_epoch will also record per-batch outputs)
+        self.pre_eval_epoch()
+        result = self.eval_epoch(loader)  # (pred_on, pred_off, pred_ens, gts)
+        self.post_eval_epoch(result)
+
+        # ===== Your existing logging (global + per-task) =====
+        n_tasks = self.current_task + 1
+        render = lambda ms: ", ".join([f"{m.compute() * 100:.2f}" for m in ms])
+        logging.info(
+            "==> Evaluation results %d"
+            "\n\tAcc: %.2f"
+            "\n\tGlobal Per Task Accs: %s"
+            "\n\tGlobal Task Accs Avg: %.2f"
+            "\n\tLocal Per Task Accs: %s",
+            self.current_epoch,
+            self.val_acc.compute() * 100,
+            render(self.val_task_accs),
+            sum([acc.compute() * 100 for acc in self.val_task_accs]) / n_tasks,
+            render(self.val_task_local_accs),
+        )
+
+        val_acc_pct = self.val_acc.compute().cpu().item() * 100
+        task_accs_pct = [acc.compute().cpu().item() * 100 for acc in self.val_task_accs]
+        global_task_acc_avg = sum(task_accs_pct) / n_tasks
+
+        val_acc_pct_rounded = round(val_acc_pct, 2)
+        global_task_acc_avg_rounded = round(global_task_acc_avg, 2)
+
+        # ===== Optional: compute additional reliability/stability metrics =====
+        # We depend on eval_epoch(...) having recorded per-batch outputs into self._last_eval.
+        extra = getattr(self, "get_last_epoch_outputs", None)
+        nll_val = float("nan")
+        ece_val = float("nan")
+        brier_val = float("nan")
+        switch_val = float("nan")
+        auc_gate = float("nan")
+        aupr_gate = float("nan")
+
+        if extra is not None:
+            cache = self.get_last_epoch_outputs() or {}
+            probs_list = cache.get("probs", [])
+            targets_list = cache.get("targets", [])
+            preds_list = cache.get("preds", [])
+            weights_list = cache.get("weights", [])
+            logits_on_ls = cache.get("logits_on", [])
+            logits_off_ls = cache.get("logits_off", [])
+
+            # Global sequences for switch-rate from predictions you already returned
+            pred_on, pred_off, pred_ens, gts = result
+            if pred_ens:
+                # Flatten to a single sequence in loader order
+                y = torch.cat(pred_ens, dim=0)
+                if y.numel() > 1:
+                    switch_val = (y[1:] != y[:-1]).float().mean().item()
+
+            # Reliability metrics if probabilities are available
+            if probs_list and targets_list:
+                probs = torch.cat(probs_list, dim=0)
+                targets = torch.cat(targets_list, dim=0)
+                # NLL
+                p = probs.gather(1, targets.view(-1, 1)).clamp_min(1e-12)
+                nll_val = float((-p.log()).mean().item())
+                # ECE (15-bin default; adjust if you prefer)
+                conf, pred = probs.max(dim=1)
+                acc = pred.eq(targets)
+                n_bins = 15
+                bins = torch.linspace(0, 1, n_bins + 1, device=probs.device)
+                ece_tmp = torch.zeros(1, device=probs.device)
+                for i in range(n_bins):
+                    m = (conf > bins[i]) & (conf <= bins[i + 1])
+                    prop = m.float().mean()
+                    if prop.item() > 0:
+                        ece_tmp += (acc[m].float().mean() - conf[m].mean()).abs() * prop
+                ece_val = float(ece_tmp.item())
+                # Brier
+                one_hot = torch.zeros_like(probs).scatter_(1, targets.view(-1, 1), 1.0)
+                brier_val = float(((probs - one_hot) ** 2).sum(dim=1).mean().item())
+
+            # Optional gating AUC / AUPRC if you expose: logits_on/off + weights
+            if logits_on_ls and logits_off_ls and weights_list and targets_list:
+                try:
+                    logits_on = torch.cat(logits_on_ls, dim=0)
+                    logits_off = torch.cat(logits_off_ls, dim=0)
+                    gates = torch.cat(weights_list, dim=0).view(-1)
+                    targets = torch.cat(targets_list, dim=0).view(-1)
+                    p_on = torch.softmax(logits_on, dim=1)
+                    p_off = torch.softmax(logits_off, dim=1)
+                    loss_on = -p_on.gather(1, targets.view(-1, 1)).log().view(-1)
+                    loss_off = -p_off.gather(1, targets.view(-1, 1)).log().view(-1)
+                    labels = (loss_on < loss_off).int().cpu().numpy()
+                    scores = gates.detach().cpu().numpy()
+                    from sklearn.metrics import roc_auc_score, average_precision_score
+                    auc_gate = float(roc_auc_score(labels, scores))
+                    aupr_gate = float(average_precision_score(labels, scores))
+                except Exception:
+                    pass  # keep NaNs if something is missing
+
+        # ===== W&B logging (keeps your fields, adds optional metrics if available) =====
+        wandb.log({
+            "Evaluation/taskId": self.current_task,
+            "Evaluation/Epoch": self.current_epoch,
+            "Evaluation/Accuracy(%)": val_acc_pct_rounded,
+            "Evaluation/GlobalPerTaskAccs": render(self.val_task_accs),
+            "Evaluation/GlobalTaskAccsAvg(%)": global_task_acc_avg_rounded,
+            "Evaluation/LocalPerTaskAccs": render(self.val_task_local_accs),
+            # Optional reliability/stability fields (may be NaN if not recorded)
+            "Evaluation/NLL": nll_val,
+            "Evaluation/ECE": ece_val,
+            "Evaluation/Brier": brier_val,
+            "Evaluation/SwitchRate": switch_val,
+            "Evaluation/GatingAUC": auc_gate,
+            "Evaluation/GatingAUPRC": aupr_gate,
         })
 
     def configure_optimizer(
