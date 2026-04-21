@@ -20,6 +20,17 @@
 
 - Install all dependencies via `pip`
     ```shell
+
+    conda create -n compx525-sm120 python=3.10 -y
+    conda activate compx525-sm120
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+    pip install scikit-learn pandas matplotlib pillow tqdm pyyaml
+
+    python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+  
+    conda env create -f cinfig/config-env.yaml
+    conda activate lae
+
     pip install -r requirements.txt
     ```
 
@@ -60,6 +71,8 @@
 - Run code with an experiment config file
     ```shell
     python main.py --config=cifar100.yaml
+    python main.py --config=vit_lora.yaml
+    python main.py --config=vit_adapter.yaml
     ```
 
 - Reproduce results in the paper

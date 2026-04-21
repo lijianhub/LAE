@@ -17,7 +17,7 @@ from libml.model.pet import Adapter, Conv2dAdapter, KVLoRA, Prefix
 from libml.model.utils import freeze, unfreeze
 from libml.model.backbone.swin import SwinTransformer
 from libml.model.backbone.convnext import ConvNeXt
-
+from ood.GeneralizedOODFactory import GeneralizedOODFactory
 
 @dataclass
 class MyModuleConf(ModuleConf):
@@ -28,6 +28,14 @@ class MyModuleConf(ModuleConf):
     ema_decay: float = 0.9999
     num_freeze_epochs: int = 3
     eval_only_emas: bool = False
+    # ==== OOD gating / ensembling ====
+    gate: str = "hybrid"  # "energy" | "gradnorm" | "hybrid"
+    ood_T: float = 1.0  # temperature for Energy/GradNorm
+    two_stage: bool = True  # enable Energy->GradNorm two-stage refinement
+    two_stage_low_q: float = 0.2  # low quantile for two-stage band
+    two_stage_high_q: float = 0.8  # high quantile for two-stage band
+    two_stage_band: str = "w"  # "w" or "Eon"
+    hybrid_alpha: float = 0.7  # mixing factor for hybrid gating
 
 
 @dataclass
@@ -67,6 +75,8 @@ class MyModule(Module):
         self.loss_fn = nn.CrossEntropyLoss()
 
         self.attach_pets(self.pets)
+        # NEW: instantiate OOD factory once (used by eval_epoch for gating/ensemble)
+        self.ood_factory = GeneralizedOODFactory(tau=0.04, lambda_oe=0.5, gradnorm_gamma=0.01).to(self.device)
 
     def create_pets_swin(self):
         assert self.cfg.pet_cls == "Adapter", "Not implemented PET"
@@ -213,6 +223,15 @@ class MyModule(Module):
                 ema.update(self.pets_emas[idx - 1])
 
     def eval_epoch(self, loader):
+        """
+                Evaluate one epoch using online/offline experts and OOD-aware gating.
+                This version removes inference_mode() so GradNorm can compute gradients safely,
+                records rich artifacts, and is robust to no-EMA cases.
+                """
+
+        # -----------------------------
+        # Build per-task global ranges
+        # -----------------------------
         task_ranges = []
         n_tasks = self.current_task + 1
         for t in range(n_tasks):
@@ -220,36 +239,179 @@ class MyModule(Module):
             e = s + self.datamodule.num_classes_of(t)
             task_ranges.append(list(range(s, e)))
 
+        # -----------------------------
+        # Return lists (kept for debug)
+        # -----------------------------
         pred_on, pred_off, pred_ens, gts = [], [], [], []
+
+        # -----------------------------
+        # Per-epoch caches for metrics
+        # -----------------------------
+        self._last_eval = {
+            "probs": [],  # list[(B, C)]
+            "targets": [],  # list[(B,)]
+            "preds": [],  # list[(B,)]
+            "weights": [],  # optional list[(B,)] if you expose gating weights
+            "logits_on": [],  # list[(B, C)]
+            "logits_off": []  # list[(B, C)]
+        }
+
+        # -----------------------------
+        # Resolve ensemble configuration
+        # -----------------------------
+        gate_cfg = getattr(self.cfg, "gate", "hybrid")
+        T_cfg = getattr(self.cfg, "ood_T", self.ood_factory.ood_T)
+        two_stage_cfg = getattr(self.cfg, "two_stage", self.ood_factory.two_stage)
+        low_q = getattr(self.cfg, "two_stage_low_q", self.ood_factory.two_stage_low_q)
+        high_q = getattr(self.cfg, "two_stage_high_q", self.ood_factory.two_stage_high_q)
+        band = getattr(self.cfg, "two_stage_band", "w")
+        alpha = getattr(self.cfg, "hybrid_alpha", self.ood_factory.hybrid_alpha)
+
+        # -----------------------------
+        # Baseline branch (no OOD): early return if disabled
+        # -----------------------------
+        use_ood = getattr(self.cfg, "use_ood_gating", False)
+        if not use_ood:
+            self.model.eval()
+            for _, batch in enumerate(loader):
+                input, target = batch[:2]
+                output = self(input)  # online logits only, no OOD, no EMA
+                # global metrics
+                self.val_acc.update(output, target)
+                # local (task-subspace) metrics
+                for t in batch[2].long().unique().tolist():
+                    sel = batch[2] == t
+                    self.val_task_accs[t].update(output[sel], target[sel])
+                    t_range = task_ranges[t]
+                    output_local = output[sel][:, t_range]
+                    target_local = target[sel] - t_range[0]
+                    self.val_task_local_accs[t].update(output_local, target_local)
+                # records for external benchmark (keep same tuple structure)
+                pred = output.argmax(dim=1)
+                pred_on.append(pred)
+                pred_off.append(pred)  # keep shape; baseline has no offline
+                pred_ens.append(pred)
+                gts.append(target)
+            return pred_on, pred_off, pred_ens, gts
+
+        # -----------------------------
+        # Evaluation loop (no inference_mode)
+        # -----------------------------
+        self.model.eval()
+
         for _, batch in enumerate(loader):
             input, target = batch[:2]
-            output, bs = self(input), input.shape[0]
-            pred_on.append(output.argmax(dim=1))
-            output_emas = [output.softmax(dim=1)]
-            for ema in self.pets_emas:
-                self.attach_pets(ema.module)
-                output_emas.append(self(input).softmax(dim=1))
 
-            for oe in output_emas[1:]:
-                pred_off.append(oe.argmax(dim=1))
-                break
+            # Always restore online PETs on exit
+            try:
+                # ---- Online forward ----
+                self.attach_pets(self.pets)  # online PETs
+                feat_on = self._encode_for_head(input)  # (B, D')
+                logits_on = self.model.head.classify(feat_on)  # (B, sumC)
+                pred_on.append(logits_on.argmax(dim=1))
 
-            if self.cfg.eval_only_emas and len(output_emas) > 1:
-                output_emas = output_emas[1:]
-            self.attach_pets(self.pets)
-            output = torch.stack(output_emas, dim=-1).max(dim=-1)[0]
+                # ---- EMA/offline forward (if any) ----
+                has_offline = len(self.pets_emas) > 0
+                if has_offline:
+                    self.attach_pets(self.pets_emas[0].module)  # switch to the first EMA
+                    feat_off = self._encode_for_head(input)  # (B, D')
+                    logits_off = self.model.head.classify(feat_off)  # (B, sumC)
+                    pred_off.append(logits_off.argmax(dim=1))
+
+                    # Optional: LAE Eq.(14) baseline
+                    if hasattr(self, "val_acc_lae") and hasattr(self.ood_factory, "lae_per_class_max"):
+                        p_lae = self.ood_factory.lae_per_class_max(logits_on, logits_off, renorm=True)
+                        self.val_acc_lae.update(p_lae, target)
+
+                    # Current-task classifier for GradNorm
+                    cur_clf = self._get_current_task_classifier().to(feat_on.device).eval()
+
+                    # OOD-aware weighted ensembling (probability space)
+                    out = self.ood_factory.compute_ensemble(
+                        logits_on=logits_on,
+                        feat_on=feat_on,
+                        logits_off=logits_off,
+                        head_on=cur_clf,
+                        gate=gate_cfg,
+                        T=T_cfg,
+                        two_stage=two_stage_cfg,
+                        energy_quantiles=(low_q, high_q),
+                        hybrid_alpha=alpha,
+                        two_stage_band=band,
+                        return_logits=False,
+                    )
+                    output = out  # probs (B, C)
+
+                    # (Optional) keep logits for gating AUC diagnostics
+                    self._last_eval["logits_on"].append(logits_on.detach())
+                    self._last_eval["logits_off"].append(logits_off.detach())
+
+                else:
+                    # Task 0: no EMA expert; use online probabilities
+                    output = torch.softmax(logits_on, dim=1)
+                    pred_off.append(logits_on.argmax(dim=1))
+
+            finally:
+                # Always restore online PETs before metric accounting
+                self.attach_pets(self.pets)
+
+            # ---------------------
+            # Global metrics
+            # ---------------------
             self.val_acc.update(output, target)
+
+            # ---------------------
+            # Local (task-subspace) metrics
+            # ---------------------
+            # batch[2] is task id per sample
             for t in batch[2].long().unique().tolist():
                 sel = batch[2] == t
                 self.val_task_accs[t].update(output[sel], target[sel])
+
                 t_range = task_ranges[t]
                 output_local = output[sel][:, t_range]
                 target_local = target[sel] - t_range[0]
                 self.val_task_local_accs[t].update(output_local, target_local)
 
+            # ---------------------
+            # Records for external benchmark
+            # ---------------------
             pred_ens.append(output.argmax(dim=1))
             gts.append(target)
+            self._last_eval["probs"].append(output.detach())
+            self._last_eval["targets"].append(target.detach())
+            self._last_eval["preds"].append(output.argmax(dim=1).detach())
+            # If later compute_ensemble exposes gating weights 'w':
+            # self._last_eval["weights"].append(w.detach())
+
+        # Return sequences for optional downstream analysis / saving
         return pred_on, pred_off, pred_ens, gts
+
+    def _encode_for_head(self, x):
+        bb = self.model.backbone
+        if hasattr(bb, "forward_features"):
+            feats = bb.forward_features(x)
+        elif hasattr(bb, "get_intermediate_layers"):
+            tmp = bb.get_intermediate_layers(x, n=1)[-1]
+            feats = tmp[0] if isinstance(tmp, (tuple, list)) else tmp
+        else:
+            raise RuntimeError("Backbone must expose forward_features or get_intermediate_layers.")
+        if isinstance(feats, dict):
+            feats = feats.get("pooled", feats.get("x", None))
+            if feats is None:
+                raise RuntimeError("Unsupported features dict structure from backbone.f")
+        if feats.ndim == 3:
+            feats = feats[:, 0]  # CLS token
+        elif feats.ndim == 4:
+            feats = self.model.head.pool(feats).flatten(1)
+        elif feats.ndim == 2:
+            pass
+        else:
+            raise RuntimeError(f"Unsupported features shape: {feats.shape}")
+        return self.model.head.neck(feats)  # (B, D')
+
+    def _get_current_task_classifier(self):
+        return self.model.head.classifiers[self.current_task]
 
     def post_eval_epoch(self, result):
         super().post_eval_epoch()

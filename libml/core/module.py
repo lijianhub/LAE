@@ -42,7 +42,10 @@ class ModuleConf:
     eval_every_n_epoch: int = 1
     log_every_n_step: int = 10
     summary_depth: int = 5
-
+    # NEW: whether to use OOD gating at evaluation time (baseline=False, sweeps=True)
+    use_ood_gating: bool = False
+    # NEW: optional sweep grid; leave None/{} to keep baseline behavior unchanged
+    eval_sweeps: dict | None = None
 
 class Module(ModuleABC):
     model: nn.Module
@@ -133,6 +136,65 @@ class Module(ModuleABC):
     def on_save_config(self, cfg: DictConfig):
         cfg.module = oc.create(oc.to_container(self.cfg))
 
+    def eval_epoch_sweep(self, loader: DataLoader = None):
+        sweeps = getattr(self.cfg, "eval_sweeps", None)
+        if not sweeps:
+            return None
+        return self.evaluate_sweeps(loader)
+
+    def _iter_eval_sweep_combos(self):
+        from itertools import product
+        sweeps = getattr(self.cfg, "eval_sweeps", None)
+        if not sweeps:
+            return []
+        try:
+            sweeps = oc.to_container(sweeps, resolve=True)
+        except Exception:
+            pass
+        if not isinstance(sweeps, dict) or len(sweeps) == 0:
+            return []
+        keys = list(sweeps.keys())
+        vals = [v if isinstance(v, (list, tuple)) else [v] for v in sweeps.values()]
+        for combo in product(*vals):
+            yield dict(zip(keys, combo))
+
+    def _format_combo_label(self, combo: dict) -> str:
+        # Build a compact label that will appear in console and W&B
+        def g(k, default):
+            return combo.get(k, getattr(self.cfg, k, default))
+        gate = g('gate', 'hybrid')
+        T = g('ood_T', 1.0)
+        alpha = g('hybrid_alpha', 0.7)
+        two = g('two_stage', True)
+        low = g('two_stage_low_q', 0.2)
+        high = g('two_stage_high_q', 0.8)
+        band = g('two_stage_band', 'w')
+        return f"gate={gate}|T={T}|alpha={alpha}|two={two}|q={low}-{high}|band={band}"
+
+    @torch.no_grad()
+    def evaluate_sweeps(self, loader: DataLoader = None):
+        combos = list(self._iter_eval_sweep_combos())
+        if not combos:
+            return
+        loader = self.val_loader if loader is None else loader
+        # Stash and force enable OOD for sweeps
+        orig_flag = getattr(self.cfg, "use_ood_gating", False)
+        keys = sorted({k for c in combos for k in c.keys()})
+        originals = {k: getattr(self.cfg, k, None) for k in keys}
+
+        logging.info(f"==> EvalSweeps: {len(combos)} combinations to evaluate …")
+        for i, combo in enumerate(combos, 1):
+            for k, v in combo.items():
+                setattr(self.cfg, k, v)
+            label = self._format_combo_label(combo)
+            logging.info(f"==> [SWEEP {i}/{len(combos)}] {label}")
+            setattr(self.cfg, "use_ood_gating", True)  # <-- turn on OOD for sweep
+            self.evaluate(loader)  # reuse baseline evaluator
+        # restore config
+        for k, v in originals.items():
+            setattr(self.cfg, k, v)
+        setattr(self.cfg, "use_ood_gating", orig_flag)
+
     def run(self, mode: str = "train"):
         if mode == "eval":
             return self.evaluate()
@@ -152,11 +214,17 @@ class Module(ModuleABC):
             interval = self.cfg.eval_every_n_epoch
             if next_epoch % interval == 0 or next_epoch == self.cfg.num_epochs:
                 self.evaluate(getattr(self, "val_loader", None))
+                # NEW: run sweeps on the same weights & dataloader for fairness
+                #self.eval_epoch_sweep(getattr(self, "val_loader", None))
                 self.trainer.save_checkpoint()
             if self.global_rank == 0:
                 kwargs = {"epoch": next_epoch}
                 self.logger.write_scalars(self.global_step, kwargs)
             self.post_train_epoch()
+
+        # run all sweeps once at the very end on the final weights
+        self.eval_epoch_sweep(getattr(self, "val_loader", None))
+        self.trainer.save_checkpoint()
 
         if self.global_rank == 0 and self.datamodule.memory is not None:
             model = self.model.clone(freeze=True).eval()

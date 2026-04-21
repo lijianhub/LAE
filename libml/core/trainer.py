@@ -33,7 +33,7 @@ _FABRIC_FLAGS = ["accelerator", "strategy", "devices", "num_nodes", "precision"]
 
 
 def get_lite_flags(cfg: TrainerConf) -> Dict[str, Any]:
-    return {k: getattr(cfg, k) for k in _FABRIC_FLAGS}
+    return {k   : getattr(cfg, k) for k in _FABRIC_FLAGS}
 
 
 class Trainer(TrainerABC):
